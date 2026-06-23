@@ -70,10 +70,3 @@ Experiments were run on Linux with a single NVIDIA GPU (Python 3.11, PyTorch +
 CUDA). Set the GPU via the `CUDA_VISIBLE_DEVICES` environment variable
 (defaults to `0`). ESM-2 embeddings are extracted once and cached; the full
 multi-seed benchmark takes several hours on one GPU.
-
-## Notes
-
-- Duplicate measurements are aggregated per `(UniProt ID, InChIKey)`, as in the
-  paper. SMILES are RDKit-canonicalized and a canonical SMILES is kept as the
-  per-molecule representative for downstream featurization.
-- Only analyses described in the manuscript are included here.
