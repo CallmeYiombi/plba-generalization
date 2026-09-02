@@ -1,0 +1,13 @@
+biopython==1.87
+fair-esm==2.0.0
+fastparquet
+numpy==2.4.4
+pandas==3.0.2
+rdkit==2025.9.6
+requests
+scikit-learn==1.8.0
+scipy==1.17.1
+shap==0.51.0
+torch==2.11.0
+torch-geometric==2.7.0
+xgboost==3.2.0

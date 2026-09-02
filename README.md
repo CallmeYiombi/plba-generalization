@@ -1,72 +1,115 @@
-# Generalization in Protein–Ligand Binding Affinity Prediction
+# Cold-Start Generalization in Protein–Ligand Binding Affinity Prediction
 
-Code for the paper *"A Systematic Evaluation of Generalization in Protein–Ligand
-Binding Affinity Prediction: Benchmarking Models on Sequence-Similar and
-Functionally Related Protein Families."*
+Analysis code for *Cold-Start Generalization in Protein–Ligand Binding
+Affinity Prediction Across Protein Families*.
 
-The pipeline builds evaluation subsets from BindingDB, benchmarks seven models
-under random and protein-level **cold-start** splits, and analyzes why
-sequence-similar proteins remain challenging (feature ablation, SHAP, and
-mutation-level analysis).
+The pipeline filters and aggregates BindingDB measurements, constructs global,
+sequence-similar, and protein-family evaluation sets, and benchmarks seven
+models under pair-level random and protein-level cold-start splits. Reported
+metrics are calculated only on held-out observations from the Global split.
 
-The scripts produce the **numerical results** reported in the paper and save
-them as CSV/JSON/Parquet. Figure rendering and LaTeX-table generation are
-intentionally omitted.
+## Requirements
 
-## Pipeline
+- Linux and Python 3.11
+- CUDA-capable GPUs for the neural models and ESM-2 embeddings
+- [MMseqs2](https://github.com/soedinglab/MMseqs2)
+- BindingDB `BindingDB_All_202603.tsv`
+- ESM-2 `esm2_t33_650M_UR50D.pt`
 
-Run the scripts from the repository root, in order; each writes intermediate
-files (under `output/`) consumed by the next.
-
-```bash
-python src/preprocess.py          # 1) build subsets  (see MMseqs2 note below)
-python src/mutation_analysis.py   # 2) mutation-level analysis
-python src/benchmark.py           # 3) train / evaluate models
-```
-
-| Step | Script | What it does | Key outputs (`output/`) |
-|------|--------|--------------|--------------------------|
-| 1 | `src/preprocess.py` | Filter BindingDB (exact Ki, single-chain, length, etc.); build the Global / Similar-protein / family-specific subsets; aggregate duplicate measurements. MMseqs2 clustering runs as a separate shell step (command printed at runtime). | `subset_global_aggregated.parquet`, `subset_similar_aggregated.parquet`, `subset_family_aggregated.parquet`, `subset_family_specific.parquet` |
-| 2 | `src/mutation_analysis.py` | Mutation-level analysis of sequence-similar protein pairs: ΔpKi over shared ligands, full-length pairwise alignment (mutation count), and correlations with mutation count and sequence identity. | `pair_mutations.parquet`, `pair_mutations_clean.parquet` (+ printed statistics: mean ΔpKi, r values, high-divergence proportions, affinity-cliff count) |
-| 3 | `src/benchmark.py` | Train/evaluate 7 models × 2 splits × 3 seeds (PCC, SRCC, RMSE, R², CI as mean ± std); bootstrap CI; SHAP protein-vs-ligand importance. | `results_multiseed_summary.csv`, `results_bootstrap_ci.csv`, `all_results_multiseed.json`, `shap_feature_group.csv`, `predictions/`, `weights/` |
-
-> **MMseqs2 break (step 1).** `preprocess.py` writes `output/proteins.fasta` and
-> prints the MMseqs2 command. Run MMseqs2 on that FASTA, then re-run
-> `preprocess.py`: it now finds `output/clusterRes_cluster.tsv` and builds the
-> Similar-protein subset.
-
-### Module layout (`src/`)
-
-| File | Role |
-|------|------|
-| `config.py` | Shared paths and settings (`DATA_PATH`, output dirs, seeds). |
-| `family_classification.py` | UniProt-annotation + keyword family classification. |
-| `features.py` | Feature extraction (AAC, Morgan FP, ESM-2, graphs) and the shared `FeatureStore`. |
-| `models.py` | Model architectures (XGBoost, DeepDTA, ESM2+MLP, GraphDTA) and per-seed training factories. |
-| `evaluation.py` | Data splits, metrics, and the multi-seed `Benchmark` orchestrator. |
-| `preprocess.py`, `mutation_analysis.py`, `benchmark.py` | Entry-point scripts for steps 1–3. |
-
-The original exploratory notebooks are kept under `notebooks/` for reference;
-`src/` is the canonical, reproducible version.
-
-## Data
-
-- **BindingDB** (`BindingDB_All_202603.tsv`, March 2026 release) — download from
-  <https://www.bindingdb.org> and set `DATA_PATH` in `src/config.py`.
-- **ESM-2 weights** (`esm2_t33_650M_UR50D`) — fetched by `fair-esm`, or point
-  `ESM2_MODEL_PATH` in `src/benchmark.py` to a local `.pt` file.
-
-Large/raw data and generated artifacts are not tracked (see `.gitignore`).
-
-## Environment
+Install the Python dependencies:
 
 ```bash
-pip install -r requirements.txt
-# MMseqs2 is an external binary (used in src/preprocess.py):
-#   https://github.com/soedinglab/MMseqs2
+python -m pip install -r requirements.txt
 ```
 
-Experiments were run on Linux with a single NVIDIA GPU (Python 3.11, PyTorch +
-CUDA). Set the GPU via the `CUDA_VISIBLE_DEVICES` environment variable
-(defaults to `0`). ESM-2 embeddings are extracted once and cached; the full
-multi-seed benchmark takes several hours on one GPU.
+## Paths
+
+Paths are configured with environment variables. Defaults are relative to the
+repository root.
+
+| Variable | Default |
+|---|---|
+| `PLBA_DATA_PATH` | `data/BindingDB_All_202603.tsv` |
+| `PLBA_OUTPUT_DIR` | `output/` |
+| `PLBA_PRED_DIR` | `predictions/` |
+| `PLBA_WEIGHT_DIR` | `weights/` |
+| `PLBA_CACHE_DIR` | `cache/` |
+| `PLBA_ESM2_MODEL_PATH` | `../esm_models/esm2_t33_650M_UR50D.pt` |
+
+Example:
+
+```bash
+export PLBA_DATA_PATH=/path/to/BindingDB_All_202603.tsv
+export PLBA_ESM2_MODEL_PATH=/path/to/esm2_t33_650M_UR50D.pt
+```
+
+## Run the analysis
+
+The three-GPU runner assigns seeds 42, 123, and 2024 to GPUs 0, 1, and 2. It
+runs the tests, preprocessing, MMseqs2 clustering when needed,
+residue-difference analysis, ESM-2 cache preparation, model benchmarking,
+result merging, and nearest-training-protein identity calculations.
+
+```bash
+mkdir -p logs
+PYTHON_BIN=/path/to/python \
+nohup bash scripts/run_full_multigpu.sh > logs/multigpu_master.log 2>&1 &
+echo $! > logs/multigpu_master.pid
+```
+
+Monitor the run:
+
+```bash
+tail -f logs/multigpu_master.log
+tail -f logs/seed42_gpu0.log
+nvidia-smi
+```
+
+The main outputs are:
+
+- `output/results_multiseed_summary.csv`
+- `output/results_bootstrap_ci.csv`
+- `output/all_results_multiseed.json`
+- `output/shap_feature_group.csv`
+- `output/shap_variance_group.csv`
+- `output/pair_residue_differences_clean.parquet`
+- `output/nearest_train_identity_random_seed2024.csv`
+- `output/nearest_train_identity_cold_seed2024.csv`
+
+## Evaluation protocol
+
+`preprocess.py` aggregates measurements by `(uniprot_id, inchikey)`. Proteins
+with malformed accessions or more than one observed chain sequence are removed
+before splitting. The Similar subset is based on MMseqs2 clusters with minimum
+sequence identity 0.4, minimum coverage 0.8, and within-cluster pKi standard
+deviation at least 1.0.
+
+Random-split evaluation intersects each analysis subset with the exact held-out
+Global pair keys. Cold-start evaluation restricts each subset to held-out
+Global protein IDs. Train, validation, and test partitions are checked for
+overlap before model fitting.
+
+DeepDTA, ESM2+MLP, and GraphDTA train for at most 300 epochs with early stopping
+after 10 validation epochs without an improvement of at least 1e-4. The
+learning rate is reduced by a factor of 0.5 after five stagnant validation
+epochs. GraphDTA metrics exclude ligands that cannot be converted to valid
+molecular graphs.
+
+## Source layout
+
+| Path | Purpose |
+|---|---|
+| `src/preprocess.py` | BindingDB filtering, UniProt annotation, subset construction, and pair aggregation |
+| `src/mutation_analysis.py` | Residue-difference and affinity-divergence analysis |
+| `src/benchmark.py` | Feature construction, model evaluation, bootstrap intervals, and SHAP analysis |
+| `src/evaluation.py` | Splits, leakage checks, held-out views, and metrics |
+| `src/models.py` | XGBoost, DeepDTA, ESM2+MLP, and GraphDTA implementations |
+| `src/nearest_train_identity.py` | MMseqs2 nearest-training-protein identity calculation |
+| `src/merge_multigpu_results.py` | Seed-worker result merge |
+| `tests/` | Regression tests for split integrity, family classification, and result merging |
+
+Run the regression tests from the repository root:
+
+```bash
+python -m unittest discover -s tests -v
+```
