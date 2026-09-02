@@ -5,10 +5,12 @@ cold-start. The Benchmark class runs each model over several seeds and both
 splits, stores per-seed predictions/metrics, and summarizes as mean +/- std.
 """
 import numpy as np
-import torch
+import pandas as pd
 from scipy import stats
 from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
+
+from data_utils import PAIR_KEY_COLUMNS
 
 
 def random_split(df, test_size=0.1, val_size=0.1, seed=42):
@@ -20,7 +22,11 @@ def random_split(df, test_size=0.1, val_size=0.1, seed=42):
 
 def cold_start_split(df, test_size=0.1, val_size=0.1, seed=42):
     """Protein-level split: train/val/test share no proteins."""
-    proteins = df["uniprot_id"].unique()
+    # pandas 3 may return a StringArray here; shuffle a standalone NumPy copy
+    # so the protein permutation has ordinary mutable-array semantics.
+    proteins = np.array(
+        df["uniprot_id"].dropna().unique().tolist(), dtype=object
+    )
     rng = np.random.RandomState(seed)
     rng.shuffle(proteins)
     n_test = int(len(proteins) * test_size)
@@ -29,6 +35,55 @@ def cold_start_split(df, test_size=0.1, val_size=0.1, seed=42):
     val = df[df["uniprot_id"].isin(proteins[n_test:n_test + n_val])]
     train = df[df["uniprot_id"].isin(proteins[n_test + n_val:])]
     return train, val, test
+
+
+def _key_set(df, columns):
+    """Return immutable row keys for overlap checks."""
+    return set(df[columns].itertuples(index=False, name=None))
+
+
+def validate_split(train, val, test, split):
+    """Fail fast if train/validation/test are not mutually exclusive."""
+    if split == "random":
+        columns = PAIR_KEY_COLUMNS
+    elif split == "cold":
+        columns = ["uniprot_id"]
+    else:
+        raise ValueError(f"Unknown split: {split}")
+
+    keys = {
+        "train": _key_set(train, columns),
+        "validation": _key_set(val, columns),
+        "test": _key_set(test, columns),
+    }
+    for left, right in (("train", "validation"), ("train", "test"),
+                        ("validation", "test")):
+        overlap = keys[left] & keys[right]
+        if overlap:
+            raise ValueError(
+                f"{split} split leakage: {len(overlap):,} {columns} keys overlap "
+                f"between {left} and {right}"
+            )
+
+
+def restrict_subset_to_test(df_subset, test_df, split):
+    """Intersect an evaluation view with the Global held-out test partition.
+
+    Random evaluation uses only exact protein-ligand pairs assigned to the
+    Global pair-level test set. Cold-start evaluation uses only proteins
+    assigned to the Global protein-level test set. Validation observations are
+    therefore never included in final metrics.
+    """
+    if split == "random":
+        test_keys = pd.MultiIndex.from_frame(
+            test_df[PAIR_KEY_COLUMNS].drop_duplicates()
+        )
+        subset_keys = pd.MultiIndex.from_frame(df_subset[PAIR_KEY_COLUMNS])
+        return df_subset.loc[subset_keys.isin(test_keys)].copy()
+    if split == "cold":
+        test_proteins = set(test_df["uniprot_id"].unique())
+        return df_subset.loc[df_subset["uniprot_id"].isin(test_proteins)].copy()
+    raise ValueError(f"Unknown split: {split}")
 
 
 def concordance_index(y_true, y_pred, seed=42):
@@ -100,12 +155,20 @@ def bootstrap_ci(y_true, y_pred, metric="PCC", n_boot=1000, seed=42):
 class Benchmark:
     """Runs models over multiple seeds/splits and accumulates results.
 
-    Splits are always drawn from df_global; trained models are then evaluated
-    on every subset. In cold-start, each subset is evaluated only on proteins
-    absent from the training set.
+    Splits are always drawn from df_global. Each evaluation view is intersected
+    with the resulting held-out Global test partition: exact pair keys for the
+    random split and test-protein IDs for the cold-start split.
     """
 
     def __init__(self, df_global, subsets, store, seeds, pred_dir):
+        duplicate_pairs = df_global.duplicated(PAIR_KEY_COLUMNS, keep=False)
+        if duplicate_pairs.any():
+            n_duplicate_rows = int(duplicate_pairs.sum())
+            raise ValueError(
+                "df_global must contain one row per (uniprot_id, inchikey) pair; "
+                f"found {n_duplicate_rows:,} rows with duplicate pair keys. "
+                "Re-run preprocess.py with pair-key aggregation."
+            )
         self.df_global = df_global
         self.subsets = subsets
         self.store = store
@@ -114,9 +177,11 @@ class Benchmark:
         self.all_results = {}   # {model: {split: {seed: {subset: metrics}}}}
         self.all_preds = {}     # {model: {split: {subset: {seed: df}}}}
         self.cold_start_meta = {}
+        self.evaluation_meta = {}
 
     def _save_predictions(self, model_name, split, subset_name, seed, df_test, y_pred):
-        df_out = df_test[["uniprot_id", "smiles", "pKi"]].copy()
+        save_columns = ["uniprot_id", "inchikey", "smiles", "pKi"]
+        df_out = df_test[[c for c in save_columns if c in df_test.columns]].copy()
         df_out["y_pred"] = y_pred
         df_out["residual"] = df_out["pKi"] - df_out["y_pred"]
         df_out.to_parquet(
@@ -125,20 +190,21 @@ class Benchmark:
         (self.all_preds.setdefault(model_name, {}).setdefault(split, {})
          .setdefault(subset_name, {}))[seed] = df_out
 
-    def _run_one_seed(self, model_name, model_fn, train_df, split, seed,
+    def _run_one_seed(self, model_name, model_fn, train_df, test_df, split, seed,
                       evaluate_fn, verbose=True):
         results = {}
         for subset_name, df_subset in self.subsets.items():
+            df_eval = restrict_subset_to_test(df_subset, test_df, split)
+            meta = {
+                "n_eval_pairs": int(len(df_eval)),
+                "n_test_proteins": int(df_eval["uniprot_id"].nunique()),
+                "n_total_pairs": int(len(df_subset)),
+                "n_total_proteins": int(df_subset["uniprot_id"].nunique()),
+            }
+            (self.evaluation_meta.setdefault(seed, {}).setdefault(split, {})
+             )[subset_name] = meta
             if split == "cold":
-                test_proteins = set(df_subset["uniprot_id"]) - set(train_df["uniprot_id"])
-                df_eval = df_subset[df_subset["uniprot_id"].isin(test_proteins)]
-                self.cold_start_meta.setdefault(seed, {})[subset_name] = {
-                    "n_test_proteins": len(test_proteins),
-                    "n_total_proteins": df_subset["uniprot_id"].nunique(),
-                    "n_eval_pairs": len(df_eval),
-                }
-            else:
-                df_eval = df_subset
+                self.cold_start_meta.setdefault(seed, {})[subset_name] = meta
             if len(df_eval) == 0:
                 continue
 
@@ -156,6 +222,8 @@ class Benchmark:
 
     def run_model(self, model_name, model_factory, splits=("random", "cold"),
                   nan_aware=False):
+        import torch
+
         evaluate_fn = safe_evaluate if nan_aware else evaluate
         for split in splits:
             print(f"\n=== {model_name} | {split.upper()} SPLIT ===")
@@ -167,17 +235,17 @@ class Benchmark:
                     torch.cuda.manual_seed_all(seed)
 
                 splitter = random_split if split == "random" else cold_start_split
-                train, val, _ = splitter(self.df_global, seed=seed)
+                train, val, test = splitter(self.df_global, seed=seed)
+                validate_split(train, val, test, split)
                 model_fn = model_factory(train, val, seed)
-                results = self._run_one_seed(model_name, model_fn, train, split, seed,
-                                             evaluate_fn)
+                results = self._run_one_seed(
+                    model_name, model_fn, train, test, split, seed, evaluate_fn
+                )
                 (self.all_results.setdefault(model_name, {})
                  .setdefault(split, {}))[seed] = results
 
     def summarize(self):
         """Aggregate all_results into a mean +/- std DataFrame."""
-        import pandas as pd
-
         rows = []
         for model, split_dict in self.all_results.items():
             for split, seed_dict in split_dict.items():

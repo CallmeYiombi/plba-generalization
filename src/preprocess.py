@@ -18,7 +18,13 @@ import numpy as np
 import pandas as pd
 
 from config import DATA_PATH, OUTPUT_DIR
-from family_classification import classify_with_source, fetch_uniprot_annotation_batch
+from data_utils import aggregate_pairs, summarize_ambiguous_protein_sequences
+from family_classification import (
+    classify_with_source,
+    fetch_uniprot_annotation_batch,
+    normalize_uniprot_accession,
+)
+from runtime_paths import UNIPROT_CACHE
 
 GLOBAL_COLS = ["reactant_id", "smiles", "inchikey", "uniprot_id", "protein_name",
                "target_name", "sequence", "seq_len", "Ki_nM", "pKi"]
@@ -59,6 +65,7 @@ df.rename(columns={
 
 # Prefer SwissProt, fall back to TrEMBL.
 df["uniprot_id"] = df["uniprot_sw"].fillna(df["uniprot_tr"])
+df["uniprot_id"] = df["uniprot_id"].astype("string").str.strip().str.upper()
 
 
 def is_exact_numeric(val):
@@ -80,8 +87,8 @@ print(f"Exact Ki rows: {mask_exact.sum():,} / {len(df):,}")
 
 df = df[mask_exact].copy()
 df["Ki_nM"] = df["Ki_nM"].astype(str).str.replace(",", "").astype(float)
-df["pKi"] = -np.log10(df["Ki_nM"] * 1e-9)
 df = df[df["Ki_nM"] > 0].copy()
+df["pKi"] = -np.log10(df["Ki_nM"] * 1e-9)
 print(f"After Ki>0: {len(df):,} | pKi {df['pKi'].min():.2f} ~ {df['pKi'].max():.2f}")
 
 
@@ -93,8 +100,58 @@ df = df[df["num_chains"] == 1].copy()
 df = df.dropna(subset=["sequence", "uniprot_id", "smiles"]).copy()
 df["seq_len"] = df["sequence"].str.len()
 df = df[df["seq_len"] >= 50].copy()
-print(f"After protein filters: {len(df):,} rows | "
-      f"{df['uniprot_id'].nunique():,} proteins | {df['smiles'].nunique():,} ligands")
+print(f"After basic protein filters: {len(df):,} rows | "
+      f"{df['uniprot_id'].nunique():,} protein identifiers | "
+      f"{df['smiles'].nunique():,} ligands")
+
+# Require one valid accession and one observed chain sequence per protein.
+valid_accession = df["uniprot_id"].map(normalize_uniprot_accession).notna()
+invalid_accession_rows = df.loc[~valid_accession].copy()
+if len(invalid_accession_rows):
+    invalid_accession_audit = (
+        invalid_accession_rows.groupby("uniprot_id", dropna=False)
+        .agg(
+            n_rows=("uniprot_id", "size"),
+            n_sequences=("sequence", "nunique"),
+            protein_name=("protein_name", "first"),
+            target_name=("target_name", "first"),
+        )
+        .reset_index()
+    )
+    invalid_accession_audit.to_csv(
+        OUTPUT_DIR / "excluded_malformed_uniprot_ids.csv", index=False
+    )
+    print(f"Excluded malformed/composite UniProt identifiers: "
+          f"{invalid_accession_audit['uniprot_id'].nunique():,} IDs | "
+          f"{len(invalid_accession_rows):,} rows")
+df = df.loc[valid_accession].copy()
+
+ambiguous_sequence_audit = summarize_ambiguous_protein_sequences(df)
+if len(ambiguous_sequence_audit):
+    ambiguous_ids = set(ambiguous_sequence_audit["uniprot_id"])
+    first_metadata = (
+        df[df["uniprot_id"].isin(ambiguous_ids)]
+        .groupby("uniprot_id")[["protein_name", "target_name"]]
+        .first()
+        .reset_index()
+    )
+    ambiguous_sequence_audit = ambiguous_sequence_audit.merge(
+        first_metadata, on="uniprot_id", how="left"
+    )
+    ambiguous_sequence_audit.to_csv(
+        OUTPUT_DIR / "excluded_multi_sequence_uniprot_ids.csv", index=False
+    )
+    ambiguous_rows = int(df["uniprot_id"].isin(ambiguous_ids).sum())
+    df = df[~df["uniprot_id"].isin(ambiguous_ids)].copy()
+    print(f"Excluded non-unique UniProt-to-sequence mappings: "
+          f"{len(ambiguous_ids):,} proteins | {ambiguous_rows:,} rows")
+
+if (df.groupby("uniprot_id")["sequence"].nunique() > 1).any():
+    raise RuntimeError("Protein-to-sequence integrity filter failed")
+
+print(f"After protein integrity filters: {len(df):,} rows | "
+      f"{df['uniprot_id'].nunique():,} proteins | "
+      f"{df['smiles'].nunique():,} ligands")
 
 # Records sharing a UniProt ID and InChIKey are one pair; keep RDKit canonical
 # SMILES as the representative.
@@ -142,7 +199,7 @@ print(f"FASTA written: {fasta_path} ({len(protein_seq):,} proteins)")
 
 print("""
 Run MMseqs2, then re-run this script:
-    mmseqs easy-cluster ./output/proteins.fasta clusterRes tmp \\
+    mmseqs easy-cluster ./output/proteins.fasta ./output/clusterRes ./output/mmseqs_tmp \\
         --min-seq-id 0.4 --cov-mode 0 -c 0.8 --threads 8
 """)
 
@@ -172,22 +229,47 @@ else:
 # --------------------------------------------------------------------------
 # 5. Family-specific subset (UniProt annotation + keyword fallback)
 # --------------------------------------------------------------------------
-annotation_cache = OUTPUT_DIR / "uniprot_family_annotation.json"
+annotation_cache = UNIPROT_CACHE
+annotation_cache.parent.mkdir(parents=True, exist_ok=True)
+uniprot_ids = df["uniprot_id"].dropna().unique().tolist()
 if annotation_cache.exists():
     with open(annotation_cache) as f:
         uniprot_anno = json.load(f)
     print(f"Loaded cached UniProt annotation: {len(uniprot_anno):,}")
 else:
-    uniprot_ids = df["uniprot_id"].dropna().unique().tolist()
-    print(f"Fetching UniProt annotation for {len(uniprot_ids):,} proteins...")
-    uniprot_anno = fetch_uniprot_annotation_batch(uniprot_ids)
-    with open(annotation_cache, "w") as f:
+    uniprot_anno = {}
+
+missing_uniprot_ids = sorted(set(uniprot_ids) - set(uniprot_anno))
+fetch_report = {
+    "requested": 0,
+    "retrieved": 0,
+    "invalid_ids": [],
+    "terminal_failed_ids": [],
+    "not_returned_ids": [],
+    "request_failures": [],
+}
+if missing_uniprot_ids:
+    print(f"Fetching missing UniProt annotation for "
+          f"{len(missing_uniprot_ids):,} proteins...")
+    new_annotations, fetch_report = fetch_uniprot_annotation_batch(
+        missing_uniprot_ids, return_report=True
+    )
+    uniprot_anno.update(new_annotations)
+    cache_tmp = annotation_cache.with_suffix(annotation_cache.suffix + ".tmp")
+    with open(cache_tmp, "w") as f:
         json.dump(uniprot_anno, f)
+    cache_tmp.replace(annotation_cache)
+with open(OUTPUT_DIR / "uniprot_fetch_report.json", "w") as f:
+    json.dump(fetch_report, f, indent=2)
+print(f"UniProt cache coverage: {len(set(uniprot_ids) & set(uniprot_anno)):,} / "
+      f"{len(set(uniprot_ids)):,} proteins")
 
 protein_info = df.drop_duplicates("uniprot_id")[
     ["uniprot_id", "protein_name", "target_name"]].copy()
 protein_info[["family", "family_source"]] = protein_info.apply(
     classify_with_source, axis=1, uniprot_anno=uniprot_anno)
+protein_info["annotation_cached"] = protein_info["uniprot_id"].isin(uniprot_anno)
+protein_info.to_csv(OUTPUT_DIR / "uniprot_annotation_audit.csv", index=False)
 
 df = df.drop(columns=["family"], errors="ignore").merge(
     protein_info[["uniprot_id", "family", "family_source"]],
@@ -205,41 +287,23 @@ for fam in CLEAN_FAMILIES:
 
 
 # --------------------------------------------------------------------------
-# 6. Aggregate duplicates by (uniprot_id, inchikey).
+# 6. Aggregate duplicates by the exact pair key (uniprot_id, inchikey).
 #    pKi is log-scale, so its arithmetic mean is the geometric mean of Ki.
 # --------------------------------------------------------------------------
-def aggregate(df_in, group_cols, extra_cols=()):
-    extra = [c for c in extra_cols if c in df_in.columns]
-
-    def _agg(g):
-        result = {
-            "smiles": g["smiles"].iloc[0],
-            "pKi": g["pKi"].mean(),
-            "Ki_nM": 10 ** (-g["pKi"].mean() + 9),
-            "n_measurements": len(g),
-        }
-        for c in extra:
-            result[c] = g[c].iloc[0]
-        return pd.Series(result)
-
-    return (df_in.groupby(group_cols, dropna=False)
-            .apply(_agg, include_groups=False).reset_index())
-
-
-df_global_agg = aggregate(
-    df_global, ["uniprot_id", "inchikey", "sequence", "protein_name", "target_name"])
+df_global_agg = aggregate_pairs(
+    df_global, extra_cols=["sequence", "protein_name", "target_name"])
 df_global_agg.to_parquet(OUTPUT_DIR / "subset_global_aggregated.parquet", index=False)
 print(f"\nGlobal aggregated: {len(df_global_agg):,} pairs")
 
 if df_similar is not None:
-    df_similar_agg = aggregate(
-        df_similar, ["uniprot_id", "inchikey", "sequence", "cluster_id"],
-        extra_cols=["protein_name", "target_name"])
+    df_similar_agg = aggregate_pairs(
+        df_similar,
+        extra_cols=["sequence", "cluster_id", "protein_name", "target_name"])
     df_similar_agg.to_parquet(OUTPUT_DIR / "subset_similar_aggregated.parquet", index=False)
     print(f"Similar aggregated: {len(df_similar_agg):,} pairs")
 
-df_family_agg = aggregate(
-    df_family, ["uniprot_id", "inchikey", "sequence", "family"],
-    extra_cols=["protein_name", "target_name", "family_source"])
+df_family_agg = aggregate_pairs(
+    df_family,
+    extra_cols=["sequence", "family", "protein_name", "target_name", "family_source"])
 df_family_agg.to_parquet(OUTPUT_DIR / "subset_family_aggregated.parquet", index=False)
 print(f"Family aggregated: {len(df_family_agg):,} pairs")

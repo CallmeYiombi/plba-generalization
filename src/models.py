@@ -22,9 +22,7 @@ from features import (
 )
 
 
-# ==========================================================================
 # XGBoost
-# ==========================================================================
 XGB_PARAMS = {
     "n_estimators": 500,
     "max_depth": 6,
@@ -56,9 +54,7 @@ def make_xgb_factory(use_protein, use_ligand, model_name, store, seeds,
     return factory
 
 
-# ==========================================================================
 # DeepDTA
-# ==========================================================================
 class DTADataset(Dataset):
     def __init__(self, df, store):
         self.data = df.reset_index(drop=True)
@@ -104,8 +100,9 @@ class DeepDTA(nn.Module):
         return self.fc(torch.cat([p, l], 1)).squeeze(-1)
 
 
-def train_dl(model, train_df, val_df, store, epochs=50, bs=256, lr=1e-3, seed=42):
-    """Train with ReduceLROnPlateau and keep the best-val checkpoint."""
+def train_dl(model, train_df, val_df, store, epochs=300, bs=256, lr=1e-3,
+             seed=42, early_stopping_patience=10, min_delta=1e-4):
+    """Train up to ``epochs`` and stop after sustained validation stagnation."""
     g = torch.Generator()
     g.manual_seed(seed)
     tl = DataLoader(DTADataset(train_df, store), bs, shuffle=True,
@@ -116,7 +113,9 @@ def train_dl(model, train_df, val_df, store, epochs=50, bs=256, lr=1e-3, seed=42
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=5, factor=0.5)
     crit = nn.MSELoss()
-    best_loss, best_state = float("inf"), None
+    best_loss, best_state, best_epoch = float("inf"), None, 0
+    patience_best = float("inf")
+    epochs_without_improvement = 0
 
     for ep in range(epochs):
         model.train()
@@ -136,12 +135,27 @@ def train_dl(model, train_df, val_df, store, epochs=50, bs=256, lr=1e-3, seed=42
 
         if vl_loss < best_loss:
             best_loss = vl_loss
+            best_epoch = ep + 1
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
+
+        if vl_loss < patience_best - min_delta:
+            patience_best = vl_loss
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
         if (ep + 1) % 10 == 0:
             print(f"      epoch {ep + 1}/{epochs} | val_loss={vl_loss:.4f}")
 
+        if epochs_without_improvement >= early_stopping_patience:
+            print(
+                f"      early stopping at epoch {ep + 1}/{epochs} | "
+                f"best_epoch={best_epoch} | best_val_loss={best_loss:.4f}"
+            )
+            break
+
     model.load_state_dict(best_state)
-    return model, best_loss
+    return model, best_loss, best_epoch
 
 
 def predict_dl(model, df_test, dataset_cls, store, bs=512):
@@ -160,8 +174,10 @@ def make_deepdta_factory(store, seeds, weight_dir):
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
         model = DeepDTA().to(DEVICE)
-        model, best_loss = train_dl(model, train_df, val_df, store, seed=seed)
-        print(f"    Best val loss: {best_loss:.4f}")
+        model, best_loss, best_epoch = train_dl(
+            model, train_df, val_df, store, seed=seed
+        )
+        print(f"    Best val loss: {best_loss:.4f} (epoch {best_epoch})")
         if seed == seeds[-1]:
             torch.save(model.state_dict(), weight_dir / f"DeepDTA_seed{seed}.pt")
         return lambda _, df_test: predict_dl(model, df_test, DTADataset, store)
@@ -169,9 +185,7 @@ def make_deepdta_factory(store, seeds, weight_dir):
     return factory
 
 
-# ==========================================================================
 # ESM2 + MLP
-# ==========================================================================
 class ESM2Dataset(Dataset):
     def __init__(self, df, store):
         self.data = df.reset_index(drop=True)
@@ -202,7 +216,8 @@ class ESM2MLP(nn.Module):
         return self.net(x).squeeze(-1)
 
 
-def train_esm2(model, train_df, val_df, store, epochs=50, bs=512, lr=1e-3, seed=42):
+def train_esm2(model, train_df, val_df, store, epochs=300, bs=512, lr=1e-3,
+               seed=42, early_stopping_patience=10, min_delta=1e-4):
     g = torch.Generator()
     g.manual_seed(seed)
     tl = DataLoader(ESM2Dataset(train_df, store), bs, shuffle=True,
@@ -213,7 +228,9 @@ def train_esm2(model, train_df, val_df, store, epochs=50, bs=512, lr=1e-3, seed=
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=5, factor=0.5)
     crit = nn.MSELoss()
-    best_loss, best_state = float("inf"), None
+    best_loss, best_state, best_epoch = float("inf"), None, 0
+    patience_best = float("inf")
+    epochs_without_improvement = 0
 
     for ep in range(epochs):
         model.train()
@@ -231,12 +248,27 @@ def train_esm2(model, train_df, val_df, store, epochs=50, bs=512, lr=1e-3, seed=
 
         if vl_loss < best_loss:
             best_loss = vl_loss
+            best_epoch = ep + 1
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
+
+        if vl_loss < patience_best - min_delta:
+            patience_best = vl_loss
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
         if (ep + 1) % 10 == 0:
             print(f"      epoch {ep + 1}/{epochs} | val_loss={vl_loss:.4f}")
 
+        if epochs_without_improvement >= early_stopping_patience:
+            print(
+                f"      early stopping at epoch {ep + 1}/{epochs} | "
+                f"best_epoch={best_epoch} | best_val_loss={best_loss:.4f}"
+            )
+            break
+
     model.load_state_dict(best_state)
-    return model, best_loss
+    return model, best_loss, best_epoch
 
 
 def predict_esm2(model, df_test, store, bs=1024):
@@ -255,8 +287,10 @@ def make_esm2mlp_factory(store, seeds, weight_dir):
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
         model = ESM2MLP().to(DEVICE)
-        model, best_loss = train_esm2(model, train_df, val_df, store, seed=seed)
-        print(f"    Best val loss: {best_loss:.4f}")
+        model, best_loss, best_epoch = train_esm2(
+            model, train_df, val_df, store, seed=seed
+        )
+        print(f"    Best val loss: {best_loss:.4f} (epoch {best_epoch})")
         if seed == seeds[-1]:
             torch.save(model.state_dict(), weight_dir / f"ESM2MLP_seed{seed}.pt")
         return lambda _, df_test: predict_esm2(model, df_test, store)
@@ -264,9 +298,7 @@ def make_esm2mlp_factory(store, seeds, weight_dir):
     return factory
 
 
-# ==========================================================================
-# GraphDTA  (ligands that fail graph conversion are excluded, not imputed)
-# ==========================================================================
+# GraphDTA
 class GraphDTADataset(Dataset):
     def __init__(self, df, store):
         self.data = df.reset_index(drop=True)
@@ -326,7 +358,8 @@ class GraphDTA(nn.Module):
         return self.fc(torch.cat([p, g], dim=1)).squeeze(-1)
 
 
-def train_graphdta(train_df, val_df, store, epochs=50, bs=256, lr=1e-3, seed=42):
+def train_graphdta(train_df, val_df, store, epochs=300, bs=256, lr=1e-3,
+                   seed=42, early_stopping_patience=10, min_delta=1e-4):
     g = torch.Generator()
     g.manual_seed(seed)
     tl = DataLoader(GraphDTADataset(train_df, store), bs, shuffle=True,
@@ -338,7 +371,9 @@ def train_graphdta(train_df, val_df, store, epochs=50, bs=256, lr=1e-3, seed=42)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=5, factor=0.5)
     crit = nn.MSELoss()
-    best_loss, best_state = float("inf"), None
+    best_loss, best_state, best_epoch = float("inf"), None, 0
+    patience_best = float("inf")
+    epochs_without_improvement = 0
 
     for ep in range(epochs):
         model.train()
@@ -357,17 +392,31 @@ def train_graphdta(train_df, val_df, store, epochs=50, bs=256, lr=1e-3, seed=42)
 
         if vl_loss < best_loss:
             best_loss = vl_loss
+            best_epoch = ep + 1
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
+
+        if vl_loss < patience_best - min_delta:
+            patience_best = vl_loss
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
         if (ep + 1) % 10 == 0:
             print(f"      epoch {ep + 1}/{epochs} | val_loss={vl_loss:.4f}")
 
+        if epochs_without_improvement >= early_stopping_patience:
+            print(
+                f"      early stopping at epoch {ep + 1}/{epochs} | "
+                f"best_epoch={best_epoch} | best_val_loss={best_loss:.4f}"
+            )
+            break
+
     model.load_state_dict(best_state)
-    return model, best_loss
+    return model, best_loss, best_epoch
 
 
 def predict_graphdta(model, df_test, store, bs=256):
-    """Predict only for convertible ligands; the rest stay NaN and are dropped
-    downstream (a previous version imputed the mean, penalizing GraphDTA)."""
+    """Return NaN for ligands without a valid graph."""
     ds = GraphDTADataset(df_test, store)
     full_preds = np.full(len(df_test), np.nan)
     if len(ds) == 0:
@@ -388,8 +437,10 @@ def make_graphdta_factory(store, seeds, weight_dir):
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
-        model, best_loss = train_graphdta(train_df, val_df, store, seed=seed)
-        print(f"    Best val loss: {best_loss:.4f}")
+        model, best_loss, best_epoch = train_graphdta(
+            train_df, val_df, store, seed=seed
+        )
+        print(f"    Best val loss: {best_loss:.4f} (epoch {best_epoch})")
         if seed == seeds[-1]:
             torch.save(model.state_dict(), weight_dir / f"GraphDTA_seed{seed}.pt")
         return lambda _, df_test: predict_graphdta(model, df_test, store)

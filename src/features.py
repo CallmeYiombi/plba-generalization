@@ -110,8 +110,9 @@ def build_graphs(smiles_list, store):
 def load_or_extract_esm2(store, esm2_path, needed_uids, model_path,
                          checkpoint_every=100):
     """Load cached ESM-2 embeddings or extract missing ones (full sequence,
-    mean-pooled, FP16). ESM2-650M is trained to 1024 aa; longer proteins
-    (~1.9% here) are still processed in full without truncation."""
+    mean-pooled, FP16). Sequences exceeding the model context are processed in
+    non-overlapping context-sized chunks and pooled across all residues, so no
+    residues are truncated."""
     if esm2_path.exists():
         store.uid_to_esm2 = np.load(esm2_path, allow_pickle=True).item()
         need_extract = [uid for uid in needed_uids if uid not in store.uid_to_esm2]
@@ -139,17 +140,40 @@ def load_or_extract_esm2(store, esm2_path, needed_uids, model_path,
     esm_model = esm_model.to(DEVICE).eval().half()
     batch_converter = alphabet.get_batch_converter()
 
+    max_positions = getattr(esm_model, "max_positions", None)
+    if callable(max_positions):
+        max_positions = max_positions()
+    if max_positions is None:
+        # fair-esm's ESM2 class has neither ``max_positions`` nor ``args``;
+        # older ESM variants may expose the value through ``args``.
+        model_args = getattr(esm_model, "args", None)
+        max_positions = getattr(model_args, "max_positions", 1024)
+    n_special_tokens = int(alphabet.prepend_bos) + int(alphabet.append_eos)
+    max_residues = int(max_positions) - n_special_tokens
+    if max_residues < 1:
+        raise ValueError(f"Invalid ESM2 context length: {max_positions}")
+
     def extract_one(seq):
         seq = seq.upper().replace("*", "").replace("U", "X").replace("O", "X")
-        _, _, tokens = batch_converter([("seq", seq)])
-        tokens = tokens.to(DEVICE)
-        with torch.no_grad():
-            results = esm_model(tokens, repr_layers=[33], return_contacts=False)
-        reps = results["representations"][33]
-        emb = reps[0, 1:len(seq) + 1].mean(0).float().cpu().numpy()
-        del results, tokens, reps
-        torch.cuda.empty_cache()
-        return emb
+        residue_sum = None
+        residue_count = 0
+        token_start = int(alphabet.prepend_bos)
+
+        for start in range(0, len(seq), max_residues):
+            chunk = seq[start:start + max_residues]
+            _, _, tokens = batch_converter([("seq", chunk)])
+            tokens = tokens.to(DEVICE)
+            with torch.no_grad():
+                results = esm_model(tokens, repr_layers=[33], return_contacts=False)
+            reps = results["representations"][33]
+            chunk_reps = reps[0, token_start:token_start + len(chunk)].float()
+            chunk_sum = chunk_reps.sum(0).cpu().numpy()
+            residue_sum = chunk_sum if residue_sum is None else residue_sum + chunk_sum
+            residue_count += len(chunk)
+            del results, tokens, reps, chunk_reps
+            torch.cuda.empty_cache()
+
+        return residue_sum / residue_count
 
     n_done = n_failed = 0
     for i, uid in enumerate(need_extract):

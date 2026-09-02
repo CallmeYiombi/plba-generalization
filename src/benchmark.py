@@ -7,12 +7,20 @@ as mean +/- std, plus bootstrap CIs, cold-start coverage, and XGB-ESM SHAP.
 Requires the aggregated subsets from preprocess.py and the ESM-2 weights
 (esm2_t33_650M_UR50D); embeddings are extracted once and cached.
 """
+import argparse
 import os
+
+from runtime_paths import (
+    ESM2_CACHE,
+    ESM2_MODEL_PATH,
+    TORCH_CACHE_DIR,
+    ensure_runtime_dirs,
+)
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-os.environ["TORCH_HOME"] = "./torch_cache"
-os.makedirs(os.environ["TORCH_HOME"], exist_ok=True)
+ensure_runtime_dirs()
+os.environ["TORCH_HOME"] = str(TORCH_CACHE_DIR)
 
 import json
 import warnings
@@ -22,7 +30,12 @@ import pandas as pd
 import torch
 
 from config import OUTPUT_DIR, PRED_DIR, SEEDS, WEIGHT_DIR
-from evaluation import Benchmark, bootstrap_ci
+from evaluation import (
+    Benchmark,
+    bootstrap_ci,
+    cold_start_split,
+    restrict_subset_to_test,
+)
 from features import (
     DEVICE,
     FeatureStore,
@@ -41,19 +54,51 @@ from models import (
 
 warnings.filterwarnings("ignore")
 
-ESM2_MODEL_PATH = "./esm_models/esm2_t33_650M_UR50D.pt"
-ESM2_CACHE = OUTPUT_DIR / "esm2_embeddings.npy"
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run the PLBA benchmark")
+    parser.add_argument(
+        "--seeds", nargs="+", type=int, default=None,
+        help="Seed(s) to run; defaults to config.SEEDS",
+    )
+    parser.add_argument(
+        "--worker-tag", default="",
+        help="Suffix for per-worker summary/JSON outputs",
+    )
+    parser.add_argument(
+        "--skip-shap", action="store_true",
+        help="Skip SHAP; use for all but one parallel worker",
+    )
+    return parser.parse_args()
+
+
+ARGS = parse_args()
+RUN_SEEDS = ARGS.seeds if ARGS.seeds is not None else SEEDS
+if not RUN_SEEDS:
+    raise ValueError("At least one seed is required")
+
+
+def output_path(filename):
+    """Use worker-specific result names without changing shared caches."""
+    path = OUTPUT_DIR / filename
+    if not ARGS.worker_tag:
+        return path
+    return path.with_name(f"{path.stem}_{ARGS.worker_tag}{path.suffix}")
+
 MODEL_ORDER = ["XGB-prot", "XGB-lig", "XGB-both", "XGB-ESM",
                "DeepDTA", "ESM2+MLP", "GraphDTA"]
 SUBSET_ORDER = ["Global", "Similar", "Kinase", "GPCR", "Protease"]
 
-np.random.seed(SEEDS[0])
-torch.manual_seed(SEEDS[0])
+np.random.seed(RUN_SEEDS[0])
+torch.manual_seed(RUN_SEEDS[0])
 if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEEDS[0])
+    torch.cuda.manual_seed_all(RUN_SEEDS[0])
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
-print(f"Device: {DEVICE} | Seeds: {SEEDS} | PyTorch: {torch.__version__}")
+print(f"Device: {DEVICE} | CUDA_VISIBLE_DEVICES="
+      f"{os.environ.get('CUDA_VISIBLE_DEVICES')} | Seeds: {RUN_SEEDS} | "
+      f"PyTorch: {torch.__version__}")
+print(f"Cache: {ESM2_CACHE} | ESM2 model: {ESM2_MODEL_PATH}")
 
 
 # --------------------------------------------------------------------------
@@ -98,7 +143,7 @@ build_graphs(df_global["smiles"].unique(), store)
 # --------------------------------------------------------------------------
 # Run models
 # --------------------------------------------------------------------------
-bench = Benchmark(df_global, SUBSETS, store, SEEDS, PRED_DIR)
+bench = Benchmark(df_global, SUBSETS, store, RUN_SEEDS, PRED_DIR)
 trained_xgb_models = {}
 
 xgb_specs = {
@@ -108,13 +153,13 @@ xgb_specs = {
     "XGB-ESM": ("esm2", True),
 }
 for name, (use_protein, use_ligand) in xgb_specs.items():
-    factory = make_xgb_factory(use_protein, use_ligand, name, store, SEEDS,
+    factory = make_xgb_factory(use_protein, use_ligand, name, store, RUN_SEEDS,
                                WEIGHT_DIR, trained_xgb_models)
     bench.run_model(name, factory)
 
-bench.run_model("DeepDTA", make_deepdta_factory(store, SEEDS, WEIGHT_DIR))
-bench.run_model("ESM2+MLP", make_esm2mlp_factory(store, SEEDS, WEIGHT_DIR))
-bench.run_model("GraphDTA", make_graphdta_factory(store, SEEDS, WEIGHT_DIR),
+bench.run_model("DeepDTA", make_deepdta_factory(store, RUN_SEEDS, WEIGHT_DIR))
+bench.run_model("ESM2+MLP", make_esm2mlp_factory(store, RUN_SEEDS, WEIGHT_DIR))
+bench.run_model("GraphDTA", make_graphdta_factory(store, RUN_SEEDS, WEIGHT_DIR),
                 nan_aware=True)
 
 
@@ -123,7 +168,7 @@ bench.run_model("GraphDTA", make_graphdta_factory(store, SEEDS, WEIGHT_DIR),
 # --------------------------------------------------------------------------
 METRICS = ["PCC", "SRCC", "RMSE", "R2", "CI"]
 df_summary = bench.summarize()
-df_summary.to_csv(OUTPUT_DIR / "results_multiseed_summary.csv", index=False)
+df_summary.to_csv(output_path("results_multiseed_summary.csv"), index=False)
 
 print("\n" + "=" * 90)
 print("Multi-seed summary (mean +/- std across seeds)")
@@ -145,7 +190,7 @@ for split in ["random", "cold"]:
         print(combined.to_string())
 
 # Bootstrap 95% CI for PCC (last seed)
-last_seed = SEEDS[-1]
+last_seed = RUN_SEEDS[-1]
 bootstrap_rows = []
 for model_name in bench.all_preds:
     for split in ["random", "cold"]:
@@ -166,35 +211,43 @@ for model_name in bench.all_preds:
                 "PCC_mean": round(mean_pcc, 4), "PCC_CI_low": round(ci_lo, 4),
                 "PCC_CI_high": round(ci_hi, 4), "n_test": len(y_true)})
 df_bootstrap = pd.DataFrame(bootstrap_rows)
-df_bootstrap.to_csv(OUTPUT_DIR / "results_bootstrap_ci.csv", index=False)
+df_bootstrap.to_csv(output_path("results_bootstrap_ci.csv"), index=False)
 print("\n" + "=" * 90)
 print("Bootstrap 95% CI for PCC (last seed)")
 print(df_bootstrap.to_string(index=False))
 
-# Cold-start coverage (first seed)
-first_seed = SEEDS[0]
-if first_seed in bench.cold_start_meta:
-    print("\nCold-start coverage (proteins evaluated / total):")
-    for subset_name, meta in bench.cold_start_meta[first_seed].items():
-        print(f"  {subset_name:<10s}: {meta['n_test_proteins']:>4,} / "
-              f"{meta['n_total_proteins']:>4,} ({meta['n_eval_pairs']:>6,} pairs)")
+# Held-out evaluation coverage (first seed)
+first_seed = RUN_SEEDS[0]
+if first_seed in bench.evaluation_meta:
+    print("\nHeld-out evaluation coverage (first seed):")
+    for split in ("random", "cold"):
+        print(f"  {split.upper()}:")
+        for subset_name, meta in bench.evaluation_meta[first_seed].get(split, {}).items():
+            print(f"    {subset_name:<10s}: {meta['n_test_proteins']:>4,} proteins, "
+                  f"{meta['n_eval_pairs']:>7,} / {meta['n_total_pairs']:>7,} pairs")
 
 # Full results JSON
 results_json = {
-    "seeds": SEEDS, "metrics": METRICS,
+    "seeds": RUN_SEEDS, "metrics": METRICS,
     "subsets": SUBSET_ORDER, "models": MODEL_ORDER,
     "all_results": bench.all_results,
+    "evaluation_meta": bench.evaluation_meta,
     "cold_start_meta": bench.cold_start_meta,
     "failed_smiles_count": {"morgan": len(store.failed_smiles),
                             "graph": len(store.failed_graph_smiles)},
 }
-with open(OUTPUT_DIR / "all_results_multiseed.json", "w") as f:
+results_json_path = output_path("all_results_multiseed.json")
+with open(results_json_path, "w") as f:
     json.dump(results_json, f, indent=2, default=str)
-print(f"\nSaved: {OUTPUT_DIR / 'all_results_multiseed.json'}")
+print(f"\nSaved: {results_json_path}")
+
+if ARGS.skip_shap:
+    print("\nSHAP skipped for this parallel worker.")
+    raise SystemExit(0)
 
 
 # --------------------------------------------------------------------------
-# SHAP analysis on XGB-ESM (protein ESM2 vs ligand Morgan FP, 1000 samples)
+# SHAP analysis on XGB-ESM (held-out cold-start pairs only, 1000 samples)
 # --------------------------------------------------------------------------
 import shap
 
@@ -204,12 +257,20 @@ if not trained_xgb_models.get("XGB-ESM"):
 else:
     model, use_protein, use_ligand = trained_xgb_models["XGB-ESM"]
     explainer = shap.TreeExplainer(model)
+    shap_seed = RUN_SEEDS[-1]
+    _, _, cold_test_global = cold_start_split(df_global, seed=shap_seed)
 
     rows = []
     for subset_name, df_sub in SUBSETS.items():
-        if len(df_sub) == 0:
+        # Explain only proteins assigned to the same held-out Global cold test
+        # partition used for the reported metrics. This prevents train/test
+        # mixtures from being presented as unseen-protein explanations.
+        df_explain = restrict_subset_to_test(df_sub, cold_test_global, "cold")
+        if len(df_explain) == 0:
             continue
-        sample = df_sub.sample(min(1000, len(df_sub)), random_state=SEEDS[-1])
+        sample = df_explain.sample(
+            min(1000, len(df_explain)), random_state=shap_seed
+        )
         sv = np.abs(explainer.shap_values(
             build_xgb_features(sample, store, use_protein, use_ligand)))
         prot, lig = sv[:, :PROT_DIM].mean(), sv[:, PROT_DIM:].mean()
@@ -217,6 +278,11 @@ else:
         n_prot_top20 = int((top20 < PROT_DIM).sum())
         rows.append({
             "subset": subset_name,
+            "explanation_split": "cold",
+            "seed": shap_seed,
+            "n_heldout_pairs": len(df_explain),
+            "n_heldout_proteins": df_explain["uniprot_id"].nunique(),
+            "sample_size": len(sample),
             "mean_abs_protein": round(float(prot), 5),
             "mean_abs_ligand": round(float(lig), 5),
             "ratio_prot_to_lig": round(float(prot / lig), 3) if lig > 0 else None,
@@ -227,19 +293,50 @@ else:
               f"protein in top20 = {n_prot_top20}/20")
     pd.DataFrame(rows).to_csv(OUTPUT_DIR / "shap_feature_group.csv", index=False)
 
-    # High- vs low-variance proteins in the Similar subset
-    protein_std = df_similar.groupby("uniprot_id")["pKi"].std().dropna()
+    # High- vs low-affinity-variance proteins among held-out Similar proteins.
+    # These are descriptive post-hoc groups, not train-time labels.
+    df_similar_heldout = restrict_subset_to_test(
+        df_similar, cold_test_global, "cold"
+    )
+    protein_std = (
+        df_similar_heldout.groupby("uniprot_id")["pKi"].std().dropna()
+    )
     hi = set(protein_std[protein_std >= 1.5].index)
     lo = set(protein_std[protein_std < 0.5].index)
-    df_hi = df_similar[df_similar["uniprot_id"].isin(hi)]
-    df_lo = df_similar[df_similar["uniprot_id"].isin(lo)]
-    n = min(1000, len(df_hi), len(df_lo))
-    if n > 0:
-        s_hi = np.abs(explainer.shap_values(build_xgb_features(
-            df_hi.sample(n, random_state=SEEDS[-1]), store, use_protein, use_ligand)))
-        s_lo = np.abs(explainer.shap_values(build_xgb_features(
-            df_lo.sample(n, random_state=SEEDS[-1]), store, use_protein, use_ligand)))
-        print(f"\nHigh-variance: protein={s_hi[:, :PROT_DIM].mean():.5f}, "
-              f"ligand={s_hi[:, PROT_DIM:].mean():.5f}")
-        print(f"Low-variance:  protein={s_lo[:, :PROT_DIM].mean():.5f}, "
-              f"ligand={s_lo[:, PROT_DIM:].mean():.5f}")
+    variance_rows = []
+    variance_groups = {
+        "High variance (pKi S.D. >= 1.5)": hi,
+        "Low variance (pKi S.D. < 0.5)": lo,
+    }
+    for group_name, protein_ids in variance_groups.items():
+        df_group = df_similar_heldout[
+            df_similar_heldout["uniprot_id"].isin(protein_ids)
+        ]
+        if len(df_group) == 0:
+            continue
+        sample = df_group.sample(min(1000, len(df_group)), random_state=shap_seed)
+        sv = np.abs(explainer.shap_values(build_xgb_features(
+            sample, store, use_protein, use_ligand
+        )))
+        prot = sv[:, :PROT_DIM].mean()
+        lig = sv[:, PROT_DIM:].mean()
+        top20 = np.argsort(sv.mean(axis=0))[-20:]
+        n_prot_top20 = int((top20 < PROT_DIM).sum())
+        variance_rows.append({
+            "group": group_name,
+            "explanation_split": "cold",
+            "seed": shap_seed,
+            "n_heldout_pairs": len(df_group),
+            "n_heldout_proteins": len(protein_ids),
+            "sample_size": len(sample),
+            "mean_abs_protein": round(float(prot), 5),
+            "mean_abs_ligand": round(float(lig), 5),
+            "ratio_prot_to_lig": round(float(prot / lig), 3) if lig > 0 else None,
+            "protein_in_top20": n_prot_top20,
+            "ligand_in_top20": 20 - n_prot_top20,
+        })
+        print(f"{group_name}: protein={prot:.5f}, ligand={lig:.5f}, "
+              f"protein in top20={n_prot_top20}/20")
+    pd.DataFrame(variance_rows).to_csv(
+        OUTPUT_DIR / "shap_variance_group.csv", index=False
+    )

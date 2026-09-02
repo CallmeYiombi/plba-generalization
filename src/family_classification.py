@@ -11,19 +11,79 @@ import pandas as pd
 import requests
 
 
-def fetch_uniprot_annotation_batch(uniprot_ids, batch_size=100, sleep=0.3):
+UNIPROT_ACCESSION_RE = re.compile(
+    r"^(?:[OPQ][0-9][A-Z0-9]{3}[0-9]|"
+    r"[A-NR-Z][0-9](?:[A-Z][A-Z0-9]{2}[0-9]){1,2})(?:-[0-9]+)?$"
+)
+
+
+def normalize_uniprot_accession(value):
+    """Return a normalized UniProt accession, or None for malformed values."""
+    if pd.isna(value):
+        return None
+    accession = str(value).strip().upper()
+    return accession if UNIPROT_ACCESSION_RE.fullmatch(accession) else None
+
+
+def _entry_to_annotation(entry):
+    kws = [kw.get("name", "") for kw in entry.get("keywords", [])]
+
+    fams = []
+    for comment in entry.get("comments", []):
+        if comment.get("commentType") == "SIMILARITY":
+            fams.extend(
+                text.get("value", "")
+                for text in comment.get("texts", [])
+                if text.get("value")
+            )
+
+    recommended = (
+        entry.get("proteinDescription", {}).get("recommendedName", {})
+    )
+    protein_name = (
+        recommended.get("fullName", {}).get("value", "")
+        if recommended else ""
+    )
+    return {
+        "keywords": kws,
+        "protein_families": fams,
+        "recommended_name": protein_name,
+    }
+
+
+def fetch_uniprot_annotation_batch(
+    uniprot_ids,
+    batch_size=25,
+    sleep=0.3,
+    max_retries=4,
+    return_report=False,
+):
     """Batch-query keyword + family info from the UniProt REST API.
 
     Returns {uid: {'keywords': [...], 'protein_families': [...],
     'recommended_name': str}}.
     """
     results = {}
-    uniprot_ids = sorted(set(uniprot_ids))
-    total = len(uniprot_ids)
-    n_success = n_fail = 0
+    raw_ids = sorted({str(uid).strip().upper() for uid in uniprot_ids
+                      if not pd.isna(uid)})
+    valid_ids = [uid for uid in raw_ids
+                 if normalize_uniprot_accession(uid) is not None]
+    invalid_ids = sorted(set(raw_ids) - set(valid_ids))
+    total = len(raw_ids)
 
-    for i in range(0, total, batch_size):
-        batch = uniprot_ids[i:i + batch_size]
+    pending = [valid_ids[i:i + batch_size]
+               for i in range(0, len(valid_ids), batch_size)]
+    n_requests = 0
+    request_failures = []
+    not_returned = set()
+    headers = {"User-Agent": "plba-generalization/1.0 (UniProt annotation)"}
+
+    if invalid_ids:
+        print(f"  [WARN] skipped {len(invalid_ids):,} malformed UniProt ID(s)")
+
+    while pending:
+        batch = pending.pop(0)
+        n_requests += 1
         query = " OR ".join(f"accession:{uid}" for uid in batch)
         params = {
             "query": query,
@@ -32,54 +92,112 @@ def fetch_uniprot_annotation_batch(uniprot_ids, batch_size=100, sleep=0.3):
             "size": batch_size,
         }
 
+        response = None
         try:
-            r = requests.get("https://rest.uniprot.org/uniprotkb/search",
-                             params=params, timeout=60)
-            if r.status_code != 200:
-                print(f"  [WARN] batch {i // batch_size + 1}: HTTP {r.status_code}")
-                n_fail += len(batch)
+            for attempt in range(max_retries + 1):
+                response = requests.get(
+                    "https://rest.uniprot.org/uniprotkb/search",
+                    params=params,
+                    headers=headers,
+                    timeout=60,
+                )
+                if response.status_code == 200:
+                    break
+                if response.status_code == 429 or response.status_code >= 500:
+                    if attempt < max_retries:
+                        retry_after = response.headers.get("Retry-After")
+                        delay = (float(retry_after) if retry_after else
+                                 sleep * (2 ** attempt))
+                        print(f"  [WARN] HTTP {response.status_code}; "
+                              f"retrying in {delay:.1f}s")
+                        time.sleep(delay)
+                        continue
+                break
+
+            if response is None or response.status_code != 200:
+                status = response.status_code if response is not None else None
+                # UniProt may reject a long OR query. Split it until the exact
+                # offending accession (if any) is isolated.
+                if status == 400 and len(batch) > 1:
+                    midpoint = len(batch) // 2
+                    pending[0:0] = [batch[:midpoint], batch[midpoint:]]
+                    print(f"  [WARN] HTTP 400 for {len(batch)} accessions; "
+                          "retrying as smaller batches")
+                    time.sleep(sleep)
+                    continue
+                detail = (response.text.replace("\n", " ")[:200]
+                          if response is not None else "no response")
+                print(f"  [WARN] request {n_requests}: HTTP {status} "
+                      f"for {batch!r} | {detail}")
+                request_failures.append({
+                    "accessions": batch,
+                    "status": status,
+                    "detail": detail,
+                })
                 time.sleep(sleep * 3)
                 continue
 
-            entries = r.json().get("results", [])
+            entries = response.json().get("results", [])
+            matched_ids = set()
             for entry in entries:
-                acc = entry.get("primaryAccession")
-                if not acc:
+                primary = str(entry.get("primaryAccession", "")).upper()
+                if not primary:
                     continue
+                aliases = {primary}
+                aliases.update(str(x).upper()
+                               for x in entry.get("secondaryAccessions", []))
+                annotation = _entry_to_annotation(entry)
 
-                kws = [kw.get("name", "") for kw in entry.get("keywords", [])]
+                # Cache under the requested identifier. This is important for
+                # obsolete secondary accessions and isoform identifiers whose
+                # API result is returned under a canonical primary accession.
+                requested_matches = [
+                    uid for uid in batch
+                    if uid in aliases or uid.split("-", 1)[0] in aliases
+                ]
+                if len(batch) == 1 and not requested_matches:
+                    requested_matches = batch
+                for uid in requested_matches:
+                    results[uid] = annotation
+                    matched_ids.add(uid)
 
-                fams = []
-                for cm in entry.get("comments", []):
-                    if cm.get("commentType") == "SIMILARITY":
-                        fams += [t.get("value", "") for t in cm.get("texts", [])
-                                 if t.get("value")]
-
-                rec = entry.get("proteinDescription", {}).get("recommendedName", {})
-                pname = rec.get("fullName", {}).get("value", "") if rec else ""
-
-                results[acc] = {
-                    "keywords": kws,
-                    "protein_families": fams,
-                    "recommended_name": pname,
-                }
-
-            n_success += len(entries)
-            if (i // batch_size + 1) % 10 == 0:
-                pct = min(100.0, (i + batch_size) / total * 100)
-                print(f"  Progress: {i + batch_size:,}/{total:,} ({pct:.1f}%) | "
-                      f"success={n_success:,}, fail={n_fail:,}")
+            not_returned.update(set(batch) - matched_ids)
+            if n_requests % 10 == 0:
+                print(f"  Progress: requests={n_requests:,} | "
+                      f"retrieved={len(results):,}, "
+                      f"terminal_failures={len(request_failures):,}, "
+                      f"pending_batches={len(pending):,}")
 
         except Exception as e:
-            print(f"  [ERROR] batch {i // batch_size + 1}: {e}")
-            n_fail += len(batch)
+            print(f"  [ERROR] request {n_requests}: {e}")
+            request_failures.append({
+                "accessions": batch,
+                "status": None,
+                "detail": str(e)[:200],
+            })
             time.sleep(sleep * 5)
 
         time.sleep(sleep)
 
-    print(f"\nFinal: {n_success:,} retrieved, {n_fail:,} failed, "
-          f"{total - n_success - n_fail:,} not in response")
-    return results
+    terminal_failed_ids = sorted({
+        uid for failure in request_failures for uid in failure["accessions"]
+    })
+    not_returned.difference_update(results)
+    not_returned.difference_update(terminal_failed_ids)
+    report = {
+        "requested": total,
+        "valid_requested": len(valid_ids),
+        "retrieved": len(results),
+        "invalid_ids": invalid_ids,
+        "terminal_failed_ids": terminal_failed_ids,
+        "not_returned_ids": sorted(not_returned),
+        "request_failures": request_failures,
+    }
+    print(f"\nFinal: {len(results):,} retrieved, "
+          f"{len(terminal_failed_ids):,} request-failed, "
+          f"{len(not_returned):,} not found, "
+          f"{len(invalid_ids):,} malformed")
+    return (results, report) if return_report else results
 
 
 # UniProt keyword -> family mapping (https://www.uniprot.org/keywords/)
