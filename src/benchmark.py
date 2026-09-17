@@ -1,8 +1,9 @@
 """Model benchmarking.
 
-Runs seven models (XGB-prot/lig/both/ESM, DeepDTA, ESM2+MLP, GraphDTA) under
-random and cold-start splits across three seeds, reporting PCC/SRCC/RMSE/R2/CI
-as mean +/- std, plus bootstrap CIs, cold-start coverage, and XGB-ESM SHAP.
+Runs a Ligand-mean reference baseline plus eight models (XGB-prot/lig/both/
+ESMonly/ESM, DeepDTA, ESM2+MLP, GraphDTA) under random and cold-start splits
+across three seeds, reporting PCC/SRCC/RMSE/R2/CI as mean +/- std, plus
+bootstrap CIs, cold-start coverage, ligand coverage, and XGB-ESM SHAP.
 
 Requires the aggregated subsets from preprocess.py and the ESM-2 weights
 (esm2_t33_650M_UR50D); embeddings are extracted once and cached.
@@ -29,6 +30,7 @@ import numpy as np
 import pandas as pd
 import torch
 
+from baselines import make_global_mean_factory, make_ligand_mean_factory
 from config import OUTPUT_DIR, PRED_DIR, SEEDS, WEIGHT_DIR
 from evaluation import (
     Benchmark,
@@ -69,6 +71,12 @@ def parse_args():
         "--skip-shap", action="store_true",
         help="Skip SHAP; use for all but one parallel worker",
     )
+    parser.add_argument(
+        "--models", nargs="+", default=None,
+        help="Run only these models; defaults to all. Every model is seeded "
+             "independently, so a filtered run reproduces the same numbers as "
+             "a full run and lets new models be merged into existing results.",
+    )
     return parser.parse_args()
 
 
@@ -85,9 +93,27 @@ def output_path(filename):
         return path
     return path.with_name(f"{path.stem}_{ARGS.worker_tag}{path.suffix}")
 
-MODEL_ORDER = ["XGB-prot", "XGB-lig", "XGB-both", "XGB-ESM",
+MODEL_ORDER = ["Ligand-mean",
+               "XGB-prot", "XGB-lig", "XGB-both", "XGB-ESMonly", "XGB-ESM",
                "DeepDTA", "ESM2+MLP", "GraphDTA"]
+if os.environ.get("PLBA_RUN_GLOBAL_MEAN") == "1":
+    MODEL_ORDER.insert(0, "Global-mean")
 SUBSET_ORDER = ["Global", "Similar", "Kinase", "GPCR", "Protease"]
+
+SELECTED_MODELS = set(ARGS.models) if ARGS.models else set(MODEL_ORDER)
+_unknown = SELECTED_MODELS - set(MODEL_ORDER)
+if _unknown:
+    raise ValueError(f"Unknown model(s): {sorted(_unknown)}. "
+                     f"Choose from {MODEL_ORDER}")
+if ARGS.models:
+    print(f"Model filter active: {[m for m in MODEL_ORDER if m in SELECTED_MODELS]}")
+
+# Only build the features the selected models actually consume. Morgan
+# fingerprints and ligand graphs are the expensive ones, and neither is needed
+# for a Ligand-mean / XGB-ESMonly top-up run.
+NEED_MORGAN = bool(SELECTED_MODELS & {"XGB-lig", "XGB-both", "XGB-ESM", "ESM2+MLP"})
+NEED_ESM2 = bool(SELECTED_MODELS & {"XGB-ESMonly", "XGB-ESM", "ESM2+MLP"})
+NEED_GRAPHS = "GraphDTA" in SELECTED_MODELS
 
 np.random.seed(RUN_SEEDS[0])
 torch.manual_seed(RUN_SEEDS[0])
@@ -130,14 +156,24 @@ uid_to_seq = (df_global.drop_duplicates("uniprot_id")
 store = FeatureStore(uid_to_seq=uid_to_seq)
 
 build_aac(store)
-build_morgan(df_global["smiles"].unique(), store)
 
-needed_uids = set()
-for df in SUBSETS.values():
-    needed_uids.update(df["uniprot_id"].unique())
-load_or_extract_esm2(store, ESM2_CACHE, needed_uids, ESM2_MODEL_PATH)
+if NEED_MORGAN:
+    build_morgan(df_global["smiles"].unique(), store)
+else:
+    print("Morgan fingerprints not required by the selected models; skipped")
 
-build_graphs(df_global["smiles"].unique(), store)
+if NEED_ESM2:
+    needed_uids = set()
+    for df in SUBSETS.values():
+        needed_uids.update(df["uniprot_id"].unique())
+    load_or_extract_esm2(store, ESM2_CACHE, needed_uids, ESM2_MODEL_PATH)
+else:
+    print("ESM-2 embeddings not required by the selected models; skipped")
+
+if NEED_GRAPHS:
+    build_graphs(df_global["smiles"].unique(), store)
+else:
+    print("Ligand graphs not required by the selected models; skipped")
 
 
 # --------------------------------------------------------------------------
@@ -146,21 +182,47 @@ build_graphs(df_global["smiles"].unique(), store)
 bench = Benchmark(df_global, SUBSETS, store, RUN_SEEDS, PRED_DIR)
 trained_xgb_models = {}
 
+# Naive reference floors, run first because they are instant and establish what
+# the trained models have to beat. Ligand-mean predicts each pair as the mean
+# training pKi of its ligand: under a protein-level cold-start split ligands are
+# not held out, so this measures how much cold-start performance is available
+# from ligand reuse alone, with no model.
+def maybe_run(name, factory, **kwargs):
+    """Run a model only if it is in the active selection."""
+    if name not in SELECTED_MODELS:
+        print(f"\n=== {name} | skipped (not in --models) ===")
+        return
+    bench.run_model(name, factory, **kwargs)
+
+
+ligand_mean_record = {}
+maybe_run("Ligand-mean", make_ligand_mean_factory(record=ligand_mean_record))
+
+# Global-mean is opt-in: a constant predictor has zero variance, so PCC, SRCC
+# and CI are undefined and return NaN. Only its RMSE and R2 are readable, and
+# the variance-normalized RMSE table already expresses the same floor.
+if os.environ.get("PLBA_RUN_GLOBAL_MEAN") == "1":
+    maybe_run("Global-mean", make_global_mean_factory())
+
 xgb_specs = {
     "XGB-prot": ("aac", False),
     "XGB-lig": (None, True),
     "XGB-both": ("aac", True),
+    "XGB-ESMonly": ("esm2", False),
     "XGB-ESM": ("esm2", True),
 }
 for name, (use_protein, use_ligand) in xgb_specs.items():
+    if name not in SELECTED_MODELS:
+        print(f"\n=== {name} | skipped (not in --models) ===")
+        continue
     factory = make_xgb_factory(use_protein, use_ligand, name, store, RUN_SEEDS,
                                WEIGHT_DIR, trained_xgb_models)
     bench.run_model(name, factory)
 
-bench.run_model("DeepDTA", make_deepdta_factory(store, RUN_SEEDS, WEIGHT_DIR))
-bench.run_model("ESM2+MLP", make_esm2mlp_factory(store, RUN_SEEDS, WEIGHT_DIR))
-bench.run_model("GraphDTA", make_graphdta_factory(store, RUN_SEEDS, WEIGHT_DIR),
-                nan_aware=True)
+maybe_run("DeepDTA", make_deepdta_factory(store, RUN_SEEDS, WEIGHT_DIR))
+maybe_run("ESM2+MLP", make_esm2mlp_factory(store, RUN_SEEDS, WEIGHT_DIR))
+maybe_run("GraphDTA", make_graphdta_factory(store, RUN_SEEDS, WEIGHT_DIR),
+          nan_aware=True)
 
 
 # --------------------------------------------------------------------------
@@ -169,6 +231,10 @@ bench.run_model("GraphDTA", make_graphdta_factory(store, RUN_SEEDS, WEIGHT_DIR),
 METRICS = ["PCC", "SRCC", "RMSE", "R2", "CI"]
 df_summary = bench.summarize()
 df_summary.to_csv(output_path("results_multiseed_summary.csv"), index=False)
+
+if ligand_mean_record.get("coverage"):
+    pd.DataFrame(ligand_mean_record["coverage"]).to_csv(
+        output_path("ligand_mean_coverage.csv"), index=False)
 
 print("\n" + "=" * 90)
 print("Multi-seed summary (mean +/- std across seeds)")
@@ -233,8 +299,10 @@ results_json = {
     "all_results": bench.all_results,
     "evaluation_meta": bench.evaluation_meta,
     "cold_start_meta": bench.cold_start_meta,
-    "failed_smiles_count": {"morgan": len(store.failed_smiles),
-                            "graph": len(store.failed_graph_smiles)},
+    "failed_smiles_count": {
+        "morgan": len(store.failed_smiles) if NEED_MORGAN else None,
+        "graph": len(store.failed_graph_smiles) if NEED_GRAPHS else None,
+    },
 }
 results_json_path = output_path("all_results_multiseed.json")
 with open(results_json_path, "w") as f:
@@ -274,6 +342,11 @@ else:
         sv = np.abs(explainer.shap_values(
             build_xgb_features(sample, store, use_protein, use_ligand)))
         prot, lig = sv[:, :PROT_DIM].mean(), sv[:, PROT_DIM:].mean()
+        # Per-feature means favor the denser block (ESM2 is 1280 dense dims,
+        # Morgan is 2048 sparse bits). Also record total attribution mass per
+        # block so the comparison does not rest on density alone.
+        prot_sum = sv[:, :PROT_DIM].sum(axis=1).mean()
+        lig_sum = sv[:, PROT_DIM:].sum(axis=1).mean()
         top20 = np.argsort(sv.mean(axis=0))[-20:]
         n_prot_top20 = int((top20 < PROT_DIM).sum())
         rows.append({
@@ -286,10 +359,15 @@ else:
             "mean_abs_protein": round(float(prot), 5),
             "mean_abs_ligand": round(float(lig), 5),
             "ratio_prot_to_lig": round(float(prot / lig), 3) if lig > 0 else None,
+            "sum_abs_protein": round(float(prot_sum), 5),
+            "sum_abs_ligand": round(float(lig_sum), 5),
+            "ratio_sum_prot_to_lig": (round(float(prot_sum / lig_sum), 3)
+                                      if lig_sum > 0 else None),
             "protein_in_top20": n_prot_top20,
             "ligand_in_top20": 20 - n_prot_top20,
         })
-        print(f"  {subset_name:<10s}: protein/ligand |SHAP| = {prot / lig:.2f}x, "
+        print(f"  {subset_name:<10s}: protein/ligand |SHAP| = {prot / lig:.2f}x "
+              f"per feature, {prot_sum / lig_sum:.2f}x summed, "
               f"protein in top20 = {n_prot_top20}/20")
     pd.DataFrame(rows).to_csv(OUTPUT_DIR / "shap_feature_group.csv", index=False)
 
@@ -320,6 +398,8 @@ else:
         )))
         prot = sv[:, :PROT_DIM].mean()
         lig = sv[:, PROT_DIM:].mean()
+        prot_sum = sv[:, :PROT_DIM].sum(axis=1).mean()
+        lig_sum = sv[:, PROT_DIM:].sum(axis=1).mean()
         top20 = np.argsort(sv.mean(axis=0))[-20:]
         n_prot_top20 = int((top20 < PROT_DIM).sum())
         variance_rows.append({
@@ -332,6 +412,10 @@ else:
             "mean_abs_protein": round(float(prot), 5),
             "mean_abs_ligand": round(float(lig), 5),
             "ratio_prot_to_lig": round(float(prot / lig), 3) if lig > 0 else None,
+            "sum_abs_protein": round(float(prot_sum), 5),
+            "sum_abs_ligand": round(float(lig_sum), 5),
+            "ratio_sum_prot_to_lig": (round(float(prot_sum / lig_sum), 3)
+                                      if lig_sum > 0 else None),
             "protein_in_top20": n_prot_top20,
             "ligand_in_top20": 20 - n_prot_top20,
         })

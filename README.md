@@ -1,12 +1,14 @@
-# Cold-Start Generalization in Protein–Ligand Binding Affinity Prediction
+# Pooled cold-start correlation does not isolate target-level generalization
 
-Analysis code for *Cold-Start Generalization in Protein–Ligand Binding
-Affinity Prediction Across Protein Families*.
+Analysis code for *Pooled cold-start correlation does not isolate target-level
+generalization in protein–ligand affinity prediction*.
 
 The pipeline filters and aggregates BindingDB measurements, constructs global,
-sequence-similar, and protein-family evaluation sets, and benchmarks seven
-models under pair-level random and protein-level cold-start splits. Reported
-metrics are calculated only on held-out observations from the Global split.
+sequence-similar, and protein-family evaluation views, and benchmarks eight
+trained models and a parameter-free Ligand-mean baseline under pair-level random
+and protein-level cold-start splits. Reported metrics are calculated only on
+held-out observations from the Global split. Cold-start correlation is then
+decomposed into between-ligand and within-ligand components.
 
 ## Requirements
 
@@ -75,6 +77,9 @@ The main outputs are:
 - `output/pair_residue_differences_clean.parquet`
 - `output/nearest_train_identity_random_seed2024.csv`
 - `output/nearest_train_identity_cold_seed2024.csv`
+- `output/ligand_mean_coverage.csv`
+- `output/ligand_coverage.csv`
+- `output/within_ligand_analysis.csv`
 
 ## Evaluation protocol
 
@@ -101,11 +106,13 @@ molecular graphs.
 |---|---|
 | `src/preprocess.py` | BindingDB filtering, UniProt annotation, subset construction, and pair aggregation |
 | `src/mutation_analysis.py` | Residue-difference and affinity-divergence analysis |
-| `src/benchmark.py` | Feature construction, model evaluation, bootstrap intervals, and SHAP analysis |
+| `src/benchmark.py` | Feature construction, the nine-model benchmark, bootstrap intervals, and SHAP analysis |
 | `src/evaluation.py` | Splits, leakage checks, held-out views, and metrics |
-| `src/models.py` | XGBoost, DeepDTA, ESM2+MLP, and GraphDTA implementations |
+| `src/models.py` | XGBoost (five feature variants), DeepDTA, ESM2+MLP, and GraphDTA implementations |
 | `src/nearest_train_identity.py` | MMseqs2 nearest-training-protein identity calculation |
 | `src/merge_multigpu_results.py` | Seed-worker result merge |
+| `scripts/generate_paper_figures.py` | Manuscript Figures 2-5 and Supplementary Figures S1-S2 at 600 dpi (Figure 1 is drawn by hand) |
+| `scripts/shap_from_saved_model.py` | Recomputes the SHAP tables from the saved XGB-ESM model without retraining |
 | `tests/` | Regression tests for split integrity, family classification, and result merging |
 
 Run the regression tests from the repository root:
@@ -116,8 +123,7 @@ python -m unittest discover -s tests -v
 
 ## Cold-start evaluation additions
 
-Three components were added after the original benchmark, all reusing the same
-splits and seeds:
+These components reuse the same splits and seeds:
 
 | Module | What it does |
 |---|---|
@@ -127,21 +133,34 @@ splits and seeds:
 
 ```bash
 python src/preprocess.py
-python src/benchmark.py                    # adds Ligand-mean and XGB-ESMonly
+python src/benchmark.py                                    # all nine models
+python src/benchmark.py --models Ligand-mean XGB-ESMonly   # subset of models
 python src/ligand_coverage_report.py
 python src/within_ligand_analysis.py
 python -m unittest discover -s tests
 ```
 
-`PLBA_RUN_GLOBAL_MEAN=1` additionally evaluates a constant predictor; its PCC is
-undefined by construction and only its RMSE and R2 are readable.
+Once every result file exists, draw the figures:
+
+```bash
+python src/nearest_train_identity.py --split cold     # Figure 3C/D inputs
+python src/nearest_train_identity.py --split random
+python scripts/generate_paper_figures.py              # or --figures 4 S1
+```
+
+Every model is seeded independently, so a run filtered with `--models` gives
+the same values as a full run. `PLBA_RUN_GLOBAL_MEAN=1` additionally evaluates a
+constant predictor; its PCC is undefined by construction and only its RMSE and
+R2 are readable.
 
 ### Known data issues
 
+Both are reported by `preprocess.py` on every run and left unchanged in the
+data, which is the dataset the published results were produced from.
+
 * 125 InChIKeys (0.16% of pairs) map to more than one canonical SMILES, mostly
-  tautomers that InChI normalises but Morgan fingerprints do not. `preprocess.py`
-  now fixes one representative SMILES per InChIKey. The published results predate
-  that fix; its effect on trained models is below the third decimal place, and
-  the within-ligand analysis excludes the affected ligands.
+  tautomers that InChI normalizes but Morgan fingerprints do not, so one ligand
+  can carry several fingerprints. `within_ligand_analysis.py` excludes these
+  InChIKeys; pass `--keep-multi-smiles` to include them.
 * InChI generation fails for 5,273 ligands (3.2% of pairs), which are keyed by
-  SMILES string instead. `preprocess.py` reports the count.
+  their SMILES string instead.

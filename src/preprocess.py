@@ -295,6 +295,19 @@ df_global_agg = aggregate_pairs(
 df_global_agg.to_parquet(OUTPUT_DIR / "subset_global_aggregated.parquet", index=False)
 print(f"\nGlobal aggregated: {len(df_global_agg):,} pairs")
 
+# Report two known ligand-identity issues. Neither changes the data: the
+# published results were produced from this dataset as-is.
+_n_smiles = df_global_agg.groupby("inchikey")["smiles"].nunique()
+_multi = set(_n_smiles[_n_smiles > 1].index)
+print(f"InChIKeys with more than one canonical SMILES: {len(_multi):,} "
+      f"({df_global_agg['inchikey'].isin(_multi).mean():.2%} of pairs); "
+      f"within_ligand_analysis.py excludes them")
+_is_ik = df_global_agg["inchikey"].astype(str).str.fullmatch(
+    r"[A-Z]{14}-[A-Z]{10}-[A-Z]")
+print(f"Ligands keyed by SMILES because InChI generation failed: "
+      f"{df_global_agg.loc[~_is_ik, 'inchikey'].nunique():,} "
+      f"({(~_is_ik).mean():.2%} of pairs)")
+
 if df_similar is not None:
     df_similar_agg = aggregate_pairs(
         df_similar,

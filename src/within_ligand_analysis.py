@@ -28,6 +28,12 @@ generalization.
 Confidence intervals use a cluster bootstrap that resamples whole ligand
 groups, because residuals inside a group are not independent.
 
+InChIKeys that carry more than one canonical SMILES in the Global dataset are
+excluded before any correlation is computed. Their Morgan fingerprints, and
+hence ligand-only predictions, are not constant within the ligand group, which
+would give XGB-lig a spurious within-ligand signal. Pass --keep-multi-smiles to
+include them.
+
     python src/within_ligand_analysis.py                  # all models, cold split
     python src/within_ligand_analysis.py --splits cold random --n-boot 500
 """
@@ -64,6 +70,19 @@ def _safe_pearson(a: np.ndarray, b: np.ndarray) -> float:
         return float("nan")
     r, _ = stats.pearsonr(a, b)
     return float(r)
+
+
+def multi_smiles_inchikeys(df: pd.DataFrame, key: str = LIGAND_KEY) -> set:
+    """InChIKeys mapped to more than one canonical SMILES."""
+    n = df.groupby(key)["smiles"].nunique()
+    return set(n[n > 1].index)
+
+
+def exclude_ligands(df: pd.DataFrame, ligands: set, key: str = LIGAND_KEY) -> pd.DataFrame:
+    """Drop every pair whose ligand is in ``ligands``."""
+    if not ligands:
+        return df
+    return df[~df[key].isin(ligands)]
 
 
 # ------------------------------------------------------------------ core
@@ -207,9 +226,20 @@ def main() -> None:
                     help="minimum held-out proteins per ligand")
     ap.add_argument("--n-boot", type=int, default=500,
                     help="cluster bootstrap resamples (0 to skip)")
+    ap.add_argument("--keep-multi-smiles", action="store_true",
+                    help="do not exclude InChIKeys with more than one canonical SMILES")
     ap.add_argument("--pred-dir", type=Path, default=PRED_DIR)
     ap.add_argument("--out", type=Path, default=OUTPUT_DIR / "within_ligand_analysis.csv")
     args = ap.parse_args()
+
+    excluded = set()
+    if not args.keep_multi_smiles:
+        df_global = pd.read_parquet(OUTPUT_DIR / "subset_global_aggregated.parquet",
+                                    columns=[LIGAND_KEY, "smiles"])
+        excluded = multi_smiles_inchikeys(df_global)
+        share = df_global[LIGAND_KEY].isin(excluded).mean()
+        print(f"Excluding {len(excluded):,} InChIKeys with more than one canonical "
+              f"SMILES ({share:.3%} of Global pairs)")
 
     rows, missing = [], []
     for split in args.splits:
@@ -220,8 +250,8 @@ def main() -> None:
                     if not path.exists():
                         missing.append(path.name)
                         continue
-                    res = analyse(pd.read_parquet(path), args.min_size,
-                                  args.n_boot, seed)
+                    preds = exclude_ligands(pd.read_parquet(path), excluded)
+                    res = analyse(preds, args.min_size, args.n_boot, seed)
                     rows.append({"model": model, "split": split, "subset": subset,
                                  "seed": seed, **res})
 
@@ -264,10 +294,18 @@ def main() -> None:
                      else f"{r.within_ligand_slope:>8.2f}"
                 print(f"  {m:<13}{r.pooled_pcc:>9.3f}{r.between_ligand_pcc:>13.3f}"
                       f"{wl}{ci:>18}{sl}{r.within_protein_pcc:>13.3f}")
-            n = s.within_ligand_n_ligands.mean()
-            p = s.within_ligand_n_pairs.mean()
-            print(f"  (within-ligand computed on {n:,.0f} ligands / {p:,.0f} pairs "
-                  f"with >= {args.min_size} held-out proteins)")
+            # GraphDTA drops ligands without a valid graph, so it is counted
+            # separately; every other model is evaluated on the same pairs.
+            core = s[s.model != "GraphDTA"]
+            msg = (f"  (within-ligand computed on "
+                   f"{core.within_ligand_n_ligands.mean():,.0f} ligands / "
+                   f"{core.within_ligand_n_pairs.mean():,.0f} pairs with "
+                   f">= {args.min_size} held-out proteins")
+            gd = s[s.model == "GraphDTA"]
+            if not gd.empty:
+                msg += (f"; GraphDTA {gd.within_ligand_n_ligands.mean():,.0f} / "
+                        f"{gd.within_ligand_n_pairs.mean():,.0f}")
+            print(msg + ")")
 
     print(f"\nWrote {args.out}")
     print("\nRead it this way: pooled PCC is what Table 1 reports. between-ligand is "

@@ -11,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from within_ligand_analysis import (  # noqa: E402
     analyse,
     between_group_pcc,
+    exclude_ligands,
+    multi_smiles_inchikeys,
     variance_decomposition,
     within_group_pcc,
 )
@@ -103,6 +105,39 @@ class TestWithinLigand(unittest.TestCase):
                           "pKi": [6.0, 8.0, 4.0, 6.0],
                           "y_pred": [7.0, 7.0, 5.0, 5.0]})
         self.assertTrue(np.isnan(between_group_pcc(d, "inchikey")["pcc"]))
+
+
+
+class TestMultiSmilesExclusion(unittest.TestCase):
+    def setUp(self):
+        # L1 has two SMILES (e.g. tautomers), so a fingerprint model predicts
+        # two different values for what the benchmark treats as one ligand.
+        self.df = pd.DataFrame({
+            "uniprot_id": ["P1", "P2", "P3", "P1", "P2", "P1", "P2", "P3"],
+            "inchikey":   ["L1", "L1", "L1", "L2", "L2", "L3", "L3", "L3"],
+            "smiles":     ["A", "A'", "A", "B", "B", "C", "C", "C"],
+            "pKi":        [6.0, 7.0, 6.5, 5.0, 6.0, 8.0, 7.0, 7.5],
+        })
+
+    def test_detects_only_ligands_with_several_smiles(self):
+        self.assertEqual(multi_smiles_inchikeys(self.df), {"L1"})
+
+    def test_exclusion_removes_every_pair_of_the_ligand(self):
+        out = exclude_ligands(self.df, {"L1"})
+        self.assertNotIn("L1", set(out["inchikey"]))
+        self.assertEqual(len(out), 5)
+
+    def test_empty_set_is_a_no_op(self):
+        self.assertIs(exclude_ligands(self.df, set()), self.df)
+
+    def test_ligand_only_predictor_is_undefined_after_exclusion(self):
+        """Without the exclusion, one SMILES-dependent ligand gives XGB-lig a
+        within-ligand value; with it, the result is n.d. as in Table 3."""
+        fp_pred = self.df["smiles"].map({"A": 6.2, "A'": 6.9, "B": 5.5, "C": 7.4})
+        d = self.df.assign(y_pred=fp_pred)
+        self.assertTrue(np.isfinite(analyse(d)["within_ligand_pcc"]))
+        kept = exclude_ligands(d, multi_smiles_inchikeys(d))
+        self.assertTrue(np.isnan(analyse(kept)["within_ligand_pcc"]))
 
 
 if __name__ == "__main__":
