@@ -76,16 +76,17 @@ def check_dataset_state(df: pd.DataFrame) -> list:
     n_multi = int((df.groupby("inchikey")["smiles"].nunique() > 1).sum())
     if n_multi == 0:
         notes.append(
-            "WARNING: no InChIKey carries more than one canonical SMILES, which "
-            "means the SMILES normalisation added after publication has already "
-            "been applied to this copy. The published numbers were produced "
-            "before that fix. Deposit the pre-fix dataset if the record is meant "
-            "to reproduce the paper, and note the normalisation separately.")
+            "WARNING: no InChIKey carries more than one canonical SMILES, so a "
+            "one-representative-SMILES-per-InChIKey normalisation has been "
+            "applied to this copy. The metrics reported in the manuscript were "
+            "computed without it. Deposit the un-normalised dataset if the "
+            "record is meant to reproduce the manuscript, and document the "
+            "normalisation separately.")
     else:
         notes.append(
-            f"{n_multi} InChIKey(s) carry more than one canonical SMILES, so this "
-            f"copy predates the post-publication normalisation and matches the "
-            f"reported results.")
+            f"{n_multi} InChIKey(s) carry more than one canonical SMILES, so no "
+            f"representative-SMILES normalisation has been applied and this copy "
+            f"matches the dataset behind the reported results.")
     import re
     ik_re = re.compile(r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$")
     bad = (~df["inchikey"].astype(str).str.match(ik_re)).sum()
@@ -318,8 +319,8 @@ def main() -> None:
         print("  WARNING: above Zenodo's 50 GB per-record limit; split the deposit "
               "or drop --include-predictions / --include-weights.")
     print("\nBefore uploading:")
-    print("  1. Confirm the BindingDB and UniProt redistribution terms cover this "
-          "derived dataset and record the licence in the Zenodo metadata.")
+    print("  1. Set the Zenodo metadata licence to CC BY 4.0 for the deposit and "
+          "MIT for code, matching the Licence section of the generated README.")
     print("  2. Reserve the DOI in Zenodo, then paste it into Data availability "
           "and Code availability in the manuscript.")
     print("  3. Keep the record versioned: publish the paper's dataset as v1 and "
@@ -342,7 +343,7 @@ Archive assembled {stamp}.
 | `data/` | Curated pair-aggregated views. The pair key is (UniProt accession, InChIKey); `pKi` is the arithmetic mean of replicate pKi values, equivalent to a geometric mean of Ki. |
 | `splits/` | Exact training / validation / test assignments for seeds {seeds}, under both the pair-level random split and the protein-level cold-start split. Regenerated with the same functions used for the reported runs. |
 | `results/` | Metric tables, bootstrap intervals, the between-ligand / within-ligand decomposition, SHAP attributions, and the provenance files documenting which records were excluded and why. |
-| `predictions/` | Per-pair observed and predicted pKi, if included. Sufficient to redo the decomposition without retraining. |
+| `predictions/` | Per-pair observed and predicted pKi for every model x split x view x seed, present when the archive is built with `--include-predictions`. Sufficient to redo the between-ligand / within-ligand decomposition without retraining. See `MANIFEST.csv` for what this deposit actually contains. |
 | `code/` | Source snapshot. The current version is at https://github.com/CallmeYiombi/plba-generalization |
 | `MANIFEST.csv` | SHA-256 checksum and size for every file. |
 
@@ -353,7 +354,7 @@ Binding affinities come from BindingDB, release BindingDB All 202603 (March
 UniProt. The raw BindingDB download is not redistributed here; the release
 identifier above is sufficient to obtain it.
 
-## Reproducing the published numbers
+## Reproducing the reported numbers
 
 ```bash
 pip install -r requirements.txt
@@ -364,7 +365,7 @@ python src/within_ligand_analysis.py
 ```
 
 The partitions in `splits/` are derived deterministically from the seeds, so a
-rerun reproduces them; they are included so that the assignment can be inspected
+rerun reproduces them exactly; they are included so that the assignment can be inspected
 or reused without running the pipeline.
 
 ## Notes on this dataset
@@ -376,18 +377,45 @@ InChI generation fails for a small fraction of ligands, which are then keyed by
 their SMILES string, so ligand identity for those rests on string equality. A
 smaller set of InChIKeys map to more than one canonical SMILES, mostly
 tautomers that InChI normalises but Morgan fingerprints do not; the
-within-ligand analysis excludes them. Preprocessing in later versions of the
-code fixes one representative SMILES per InChIKey, which changes trained-model
-metrics by less than 0.001.
+within-ligand analysis excludes them. Fixing one representative SMILES per
+InChIKey instead of excluding those pairs changes trained-model metrics by less
+than 0.001.
+
+Convolutional and graph-scatter operations are not bit-reproducible on GPU even
+with deterministic cuDNN settings, so a rerun of DeepDTA and GraphDTA at the
+same seed reproduces the reported metrics to about 0.01 rather than exactly. The
+tree-based models, the ligand-mean baseline, and ESM2+MLP reproduce exactly.
 
 ## Licence
 
-[TODO: state the licence for this deposit and confirm it is compatible with the
-BindingDB and UniProt terms for redistributing derived data.]
+The source code in `code/` is released under the MIT Licence, as in the GitHub
+repository.
+
+The curated data, partitions, results, and predictions are released under the
+Creative Commons Attribution 4.0 International Licence (CC BY 4.0).
+
+These files are derived from two upstream sources, both of which permit
+redistribution of derivative works with attribution:
+
+* BindingDB, licensed CC BY 3.0 US. Liu T, Lin Y, Wen X, et al. BindingDB: a
+  web-accessible database of experimentally determined protein-ligand binding
+  affinities. Nucleic Acids Res. 2007;35:D198-201.
+* UniProt, licensed CC BY 4.0. UniProt Consortium. UniProt: the Universal
+  Protein Knowledgebase in 2023. Nucleic Acids Res. 2023;51:D523-31.
+
+The raw BindingDB download is not redistributed here; only pair-aggregated
+values derived from it are.
 
 ## Citation
 
-[TODO: add the article citation once the DOI is assigned.]
+Cite this deposit as:
+
+> Yang HW, Kim J, Dong JJ, Abbas Z, Lee SW. Cold-start evaluation of
+> protein-ligand binding affinity models: data, partitions, results, and code.
+> Zenodo. 2026. doi:INSERT-RECORD-DOI
+
+The accompanying manuscript is under review. Its citation will be added as a new
+version of this record once the article is published.
 """
 
 
