@@ -412,7 +412,7 @@ Cite this deposit as:
 
 > Yang HW, Kim J, Dong JJ, Abbas Z, Lee SW. Cold-start evaluation of
 > protein-ligand binding affinity models: data, partitions, results, and code.
-> Zenodo. 2026. doi:INSERT-RECORD-DOI
+> Zenodo. 2026. doi:10.5281/zenodo.23234743
 
 The accompanying manuscript is under review. Its citation will be added as a new
 version of this record once the article is published.
