@@ -188,10 +188,7 @@ def per_protein_pcc(predictions: pd.DataFrame, minimum_pairs: int = 5) -> pd.Dat
 
 
 def identity_path(split: str) -> Path:
-    name = ("nearest_train_identity_seed" if split == "cold"
-            else "nearest_other_train_identity_random_seed")
-    return OUTPUT_DIR / f"{name}{IDENTITY_SEED}.csv"
-
+    return OUTPUT_DIR / f"nearest_train_identity_{split}_seed{IDENTITY_SEED}.csv"
 
 def plot_identity_split(ax, split, panel):
     path = identity_path(split)
