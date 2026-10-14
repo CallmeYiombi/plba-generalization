@@ -407,7 +407,6 @@ The raw BindingDB download is not redistributed here; only pair-aggregated
 values derived from it are.
 
 ## Citation
-
 Cite this deposit as:
 
 > Yang HW, Kim J, Dong JJ, Abbas Z, Lee SW. Cold-start evaluation of
