@@ -164,3 +164,5 @@ data, which is the dataset the published results were produced from.
   InChIKeys; pass `--keep-multi-smiles` to include them.
 * InChI generation fails for 5,273 ligands (3.2% of pairs), which are keyed by
   their SMILES string instead.
+
+  Zenodo. 2026. doi:10.5281/zenodo.23234743
